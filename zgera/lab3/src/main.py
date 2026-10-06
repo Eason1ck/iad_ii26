@@ -63,10 +63,15 @@ def load_ctg(path):
     return X, y
 
 
+def _sigmoid(z):
+    # Численно устойчивая сигмоида: sigma(z) = 0.5 * (1 + tanh(z / 2)), без overflow в exp
+    return 0.5 * (1.0 + np.tanh(0.5 * z))
+
+
 ACTS = {
     "relu": (lambda z: np.maximum(z, 0.0), lambda a: (a > 0).astype(a.dtype)),
     "tanh": (np.tanh, lambda a: 1.0 - a * a),
-    "sigmoid": (lambda z: 1.0 / (1.0 + np.exp(-z)), lambda a: a * (1.0 - a)),
+    "sigmoid": (_sigmoid, lambda a: a * (1.0 - a)),
 }
 
 
@@ -86,7 +91,10 @@ class MLP:
             if act == "relu" and i < last:
                 W = rng.normal(0.0, np.sqrt(2.0 / n_in), (n_in, n_out))
             else:
-                lim = np.sqrt(6.0 / (n_in + n_out))
+                # Для сигмоиды на скрытых слоях Glorot-масштаб умножается на 4
+                # (Glorot & Bengio, 2010); выходной слой остаётся с обычным масштабом
+                gain = 4.0 if (act == "sigmoid" and i < last) else 1.0
+                lim = gain * np.sqrt(6.0 / (n_in + n_out))
                 W = rng.uniform(-lim, lim, (n_in, n_out))
             self.W.append(W)
             self.b.append(np.zeros(n_out))
@@ -394,40 +402,62 @@ def summarize(res, a, outdir, n_total, class_counts, n_feat):
     return text
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="CTG.xls", help="путь к CTG.xls / .xlsx / .csv")
-    ap.add_argument("--out", default="results")
-    ap.add_argument("--seeds", type=int, default=10)
-    ap.add_argument("--act", default="relu", choices=list(ACTS))
-    ap.add_argument("--hidden", type=int, nargs="+", default=[64, 48, 32, 16])
-    ap.add_argument("--epochs", type=int, default=100, help="эпох дообучения")
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--l2", type=float, default=1e-4)
-    ap.add_argument("--ae-epochs", dest="ae_epochs", type=int, default=60,
-                    help="эпох предобучения одного автоэнкодера")
-    ap.add_argument("--ae-lr", dest="ae_lr", type=float, default=1e-3)
-    ap.add_argument("--noise", type=float, default=0.0,
-                    help="доля std входа как шум (denoising AE); 0 - обычный AE")
-    a = ap.parse_args()
+# ======================= НАСТРОЙКИ (меняйте здесь, аргументы не нужны) =======================
+DATA = "CTG.xls"                      # путь к файлу; относительный путь ищется рядом со скриптом
+OUT = "results"                       # для каждой активации создаётся подпапка results/<act>
+SEEDS = 10
+ACTIVATIONS = ["relu", "sigmoid"]     # можно добавить "tanh"
+LR = {"relu": 1e-3, "tanh": 1e-3, "sigmoid": 3e-3}
+AE_LR = {"relu": 1e-3, "tanh": 1e-3, "sigmoid": 3e-3}
+HIDDEN = [64, 48, 32, 16]
+EPOCHS = 100
+AE_EPOCHS = 60
+BATCH = 32
+L2 = 1e-4
+NOISE = 0.0                           # >0 включает denoising-автоэнкодер
+# =============================================================================================
 
-    os.makedirs(a.out, exist_ok=True)
-    X, y = load_ctg(a.data)
+
+def main():
+    data = DATA
+    if not os.path.isabs(data) and not os.path.exists(data):
+        data = os.path.join(os.path.dirname(os.path.abspath(__file__)), data)
+    X, y = load_ctg(data)
     counts = np.bincount(y, minlength=3).tolist()
     print(f"Загружено: {X.shape[0]} объектов, {X.shape[1]} признаков, классы: {counts}")
 
-    res = []
-    for s in range(a.seeds):
-        t0 = time.time()
-        r = run_seed(X, y, s, a)
-        res.append(r)
-        print(f"seed {s}: macro-F1  без = {r['scratch']['metrics']['macro_f1']:.4f}  "
-              f"с = {r['pretrained']['metrics']['macro_f1']:.4f}  ({time.time() - t0:.0f} c)")
+    summary = {}
+    for act in ACTIVATIONS:
+        a = argparse.Namespace(act=act, hidden=HIDDEN, epochs=EPOCHS, lr=LR[act],
+                               batch=BATCH, l2=L2, ae_epochs=AE_EPOCHS,
+                               ae_lr=AE_LR[act], noise=NOISE)
+        outdir = os.path.join(OUT, act)
+        os.makedirs(outdir, exist_ok=True)
+        print("\n" + "=" * 90 + f"\nАКТИВАЦИЯ: {act}  (lr={a.lr}, ae_lr={a.ae_lr})\n" + "=" * 90)
 
-    make_plots(res, a, a.out)
-    print("\n" + summarize(res, a, a.out, len(y), counts, X.shape[1]))
-    print(f"\nФайлы сохранены в: {os.path.abspath(a.out)}")
+        res = []
+        for s in range(SEEDS):
+            t0 = time.time()
+            r = run_seed(X, y, s, a)
+            res.append(r)
+            print(f"seed {s}: macro-F1  без = {r['scratch']['metrics']['macro_f1']:.4f}  "
+                  f"с = {r['pretrained']['metrics']['macro_f1']:.4f}  ({time.time() - t0:.0f} c)")
+
+        make_plots(res, a, outdir)
+        print("\n" + summarize(res, a, outdir, len(y), counts, X.shape[1]))
+        summary[act] = (
+            [r["scratch"]["metrics"]["macro_f1"] for r in res],
+            [r["pretrained"]["metrics"]["macro_f1"] for r in res],
+            [r["scratch"]["metrics"]["accuracy"] for r in res],
+            [r["pretrained"]["metrics"]["accuracy"] for r in res],
+        )
+
+    print("\n" + "=" * 90 + "\nИТОГОВОЕ СРАВНЕНИЕ (среднее ± std по разбиениям)\n" + "=" * 90)
+    print(f"{'активация':<10}{'macro-F1 без':<20}{'macro-F1 с':<20}{'accuracy без':<20}{'accuracy с':<20}")
+    for act, (fa, fb, aa, ab) in summary.items():
+        print(f"{act:<10}{np.mean(fa):.4f} ± {np.std(fa):.4f}   {np.mean(fb):.4f} ± {np.std(fb):.4f}   "
+              f"{np.mean(aa):.4f} ± {np.std(aa):.4f}   {np.mean(ab):.4f} ± {np.std(ab):.4f}")
+    print(f"\nФайлы сохранены в: {os.path.abspath(OUT)}")
 
 
 if __name__ == "__main__":
